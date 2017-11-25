@@ -1,0 +1,375 @@
+#!/bin/bash
+#
+# Copyright 2012-2014 "Korora Project" <dev@kororaproject.org>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program. If not, see <http://www.gnu.org/licenses/>.
+#
+
+#
+# INTIALISE
+#
+OPT_VERBOSE=
+OPT_CHECKOUT_ONLY=
+OPT_FETCH_ONLY=
+OPT_INTERACTIVE=
+OPT_PUSH_AFTER_UPDATE=
+OPT_RESET=
+OPT_FORCE_REMOTE_FETCH=
+OPT_FORCE_LOCAL_VERSION=
+OPT_CACHE=
+OPT_INCLUDE_DEPRECATED=
+OPT_NO_PULL=
+OPT_NO_PUSH=1
+
+#
+# FUNCTIONS
+#
+function usage {
+  _EXIT_VAL=${1:-0}
+
+  cat << EOF
+Usage: $0 sync [-v]
+
+Options:
+  -C   Use cached version of upstream configuration information
+  -v   Show verbose output
+  -?   Show this usage
+  -V   Show version
+  -i   Interactive
+
+Long Options:
+  --cache                Same as -C
+  --force-remote-fetch   Force a sync with remote upsteam
+  --force-local-version  Force the configuration to be updated based on local versions
+  --interactive          Same as -i
+  --push                 Push local changes upstream
+  --no-pull              Do not pull and merge upstream changes
+  --fetch-only           Only fetch from remotes, don't pull or rebase
+  --include-deprecated   Include deprecated packages
+  --verbose              Same as -v
+  --help                 Same as -?
+  --version              Same as -V
+
+EOF
+
+  exit ${_EXIT_VAL};
+}
+
+
+
+#
+# PARSE COMMAND LINE
+#
+
+function parse_args {
+  CMD_LINE=$(getopt -n$0 -u --longoptions="cache reset force-remote-fetch force-local-version include-deprecated verbose version help interactive push no-pull fetch-only" "C v V ? i" $@)
+  [ ${?} -ne 0 ] && usage 1
+
+  set -- ${CMD_LINE}
+
+  while [ $# -gt 0 ]
+  do
+    case "$1" in
+      -C|--cache)
+        OPT_CACHE=1
+        ;;
+      --reset)
+        OPT_RESET=1
+        ;;
+      --force-remote-fetch)
+        OPT_FORCE_REMOTE_FETCH=1
+        ;;
+      --force-local-version)
+        OPT_FORCE_LOCAL_VERSION=1
+        ;;
+      -i|--interactive)
+        OPT_INTERACTIVE=1
+        ;;
+      --no-pull)
+        OPT_NO_PULL=1
+        ;;
+      --push)
+        OPT_NO_PUSH=
+        ;;
+      --fetch-only)
+        OPT_FETCH_ONLY=1
+        ;;
+      --include-deprecated)
+        OPT_INCLUDE_DEPRECATED=1
+        ;;
+      -v|--verbose)
+        OPT_VERBOSE=1
+        ;;
+      -V|--version)
+        version 0
+        ;;
+      --help)
+        usage 0
+        ;;
+      --)
+        shift
+        break
+        ;;
+      -*)
+        usage 1
+        ;;
+      *)
+        break
+    esac
+    shift
+  done
+
+  # remaining arguments are packages
+  PACKAGES=""
+  if [ $# -eq 0 ]
+  then
+    echo "Syncing all packages ..."
+  else
+    while [ $# -gt 0 ]
+    do
+      PACKAGES="${PACKAGES} $1"
+      shift
+    done
+  fi
+}
+
+
+#
+# MAIN
+#
+
+function main {
+  list_config_validate "${PACKAGES}"
+  if [ ${?} -gt 0 ]
+  then
+    CURRENT_BRANCH=
+
+    # flag for new branches (ie local only)
+    BRANCH_LOCAL_ONLY=
+
+    # check that we have packages to sync
+    if [ -z "$(ls -A ${WORKING_PACKAGES_DIR})" ]
+    then
+      _error "There are no packages checked out. Try kp --checkout."
+      return 1
+    fi
+
+    # synchronise package cache first
+    if [[ -z "${OPT_CACHE}" || ${OPT_CACHE} -ne 1 ]]
+    then
+      _info "Synchronising upstream configuration information ..."
+
+      _pushd "${WORKING_DIR}/conf"
+
+      if [ "${OPT_RESET}" == "1" ]
+      then
+        git reset --hard
+      fi
+
+      _debug "Fetching configuration information ..."
+      git fetch --all || exit 1
+
+      if [[ -z "${OPT_FETCH_ONLY}" ]]
+      then
+        CURRENT_BRANCH=$(_git_branch_active)
+        _DELTA_COUNT=0
+
+        # check if our current branch is available remotely
+        _git_remote_branch_available "${CURRENT_BRANCH}"
+        if [ ${?} -eq 0 ]
+        then
+
+          # we should always attempt a remote pull (with rebase) on our configuration
+          # it's the only way to manage upstream sync
+          _debug "Rebasing configuration information ..."
+          git pull --rebase origin "${CURRENT_BRANCH}" || exit 1
+
+          _DELTA_COUNT=$(git rev-list HEAD...origin/${CURRENT_BRANCH} --count)
+
+        # otherwise, we're a new branch
+        else
+          BRANCH_LOCAL_ONLY=1
+        fi
+
+        if [ "${OPT_NO_PUSH}" != "1" ]
+        then
+          if [[ ${_DELTA_COUNT} -gt 0 || "${BRANCH_LOCAL_ONLY}" == "1" ]]
+          then
+            _info "Pushing new local configuration branch: ${CURRENT_BRANCH}"
+
+            git push origin "${CURRENT_BRANCH}"
+            if [ ${?} -ne 0 ]
+            then
+              _error "Unable to push new local configuration branch."
+              return 1
+            fi
+
+          fi
+        else
+          _info "Not pushing configuration changes upstream. To push add --push."
+        fi
+
+        # we have no reason to push local changes at this point
+        # as we shouldn't be locally modifying the configuration
+        echo
+
+        _popd
+      fi
+    fi
+
+    # process each package for sync
+    for F in $(list_config_available "${PACKAGES}")
+    do
+      # load the configuration
+      load_config ${F} || continue
+
+      # check for package deprecation, skip unless we're including them
+      if [ "${KP_DEPRECATED}" == "yes" -a "${OPT_INCLUDE_DEPRECATED}" != "1" ]
+      then
+        _debug "Skipping deprecated package: ${KP_NAME}\n"
+        continue
+      fi
+
+      get_sync_status || continue
+
+      # ignore non-checked out sources
+      [ "${KP_PACKAGE_SYNC_STATE}" == "-" ] && continue
+
+      _info "Syncing: ${KP_NAME}"
+
+      # move to local working dir
+      _pushd "${WORKING_PACKAGES_DIR}/${KP_NAME}"
+
+      if [ "${OPT_RESET}" == "1" ]
+      then
+        git reset --hard
+      fi
+
+      if [[ -n "${OPT_FETCH_ONLY}" ]]
+      then
+        git fetch --all
+      else
+        # calculate the local/remote heads
+        _LOCAL_HEAD=$(git log --pretty=format:'%H' -n 1)
+        _REMOTE_HEAD=
+        _DELTA_COUNT=0
+
+        _HAVE_DELTA=
+        [ "${KP_RELEASE_GIT_COMMIT}" != "${_LOCAL_HEAD}" ] && _HAVE_DELTA=1
+
+        # check if our current branch is available remotely
+        _BRANCH_LOCAL_ONLY=
+        _git_remote_branch_available "${CURRENT_BRANCH}"
+        if [ ${?} -eq 0 ]
+        then
+          _REMOTE_HEAD=$(git log --pretty=format:'%H' -n 1 origin/${CURRENT_BRANCH})
+
+          # calculate commit delta count
+          _DELTA_COUNT=$(git rev-list HEAD...origin/${CURRENT_BRANCH} --count)
+
+          _info " L: ${_LOCAL_HEAD}\n R: ${_REMOTE_HEAD}\n C: ${KP_RELEASE_GIT_COMMIT}\n D: ${_DELTA_COUNT}"
+
+          # remote and local differ so let's fetch and assess
+          if [[ "${_HAVE_DELTA}" == "1" || "${_LOCAL_HEAD}" != "${_REMOTE_HEAD}" || "${OPT_FORCE_REMOTE_FETCH}" == "1" ]]
+          then
+            _debug "Fetching upstream package ref(s) ..."
+            git fetch || exit 1
+
+            # re-calculate the remote head
+
+            # re-calculate commit delta count
+            _DELTA_COUNT=$(git rev-list HEAD...origin/${CURRENT_BRANCH} --count)
+
+            if [[ ${_DELTA_COUNT} -gt 0 ]]
+            then
+              if [[ "${OPT_NO_PULL}" != "1" ]]
+              then
+                _info "Pulling upstream changes ..."
+                git pull --rebase origin "${CURRENT_BRANCH}" || exit 1
+
+                # re-calculate commits delta count
+                _DELTA_COUNT=$(git rev-list HEAD...origin/${CURRENT_BRANCH} --count)
+              else
+                _info "Not pulling upstream changes. To pull add --pull."
+              fi
+            else
+              _info "Nothing new to pull."
+            fi
+
+            # recalculate heads
+            _LOCAL_HEAD=$(git log --pretty=format:'%H' -n 1)
+            _REMOTE_HEAD=$(git log --pretty=format:'%H' -n 1 origin/${CURRENT_BRANCH})
+            _HAVE_DELTA=
+            [ "${KP_RELEASE_GIT_COMMIT}" != "${_LOCAL_HEAD}" ] && _HAVE_DELTA=1
+
+            _info " L: ${_LOCAL_HEAD}\n R: ${_REMOTE_HEAD}\n C: ${KP_RELEASE_GIT_COMMIT}\n D: ${_DELTA_COUNT}"
+          fi
+        else
+          _BRANCH_LOCAL_ONLY=1
+          _info " L: ${_LOCAL_HEAD}\n R: not available\n C: ${KP_RELEASE_GIT_COMMIT}\n D: ${_DELTA_COUNT}"
+        fi
+
+        if [[ ${_DELTA_COUNT} -gt 0 || "${_BRANCH_LOCAL_ONLY}" == "1" ]]
+        then
+          if [[ "${OPT_NO_PUSH}" != "1" ]]
+          then
+            _info "Pushing local changes upstream ..."
+            git push origin "${CURRENT_BRANCH}" || exit 1
+          else
+            _info "Not pushing local changes upstream. To push add --push."
+          fi
+        else
+          _info "Nothing new to push."
+        fi
+
+        # we have a head so update the configuration information
+        if [[ "${_HAVE_DELTA}" == "1" || "${OPT_FORCE_LOCAL_VERSION}" == "1" ]]
+        then
+          if [[ "${KP_UPSTREAM_SRC_TYPE}" != "srpm" ]]
+          then
+            _VERBOSE_FORCE=
+            [ "${OPT_FORCE_LOCAL_VERSION}" == "1" ] && _VERBOSE_FORCE=" (forced)"
+            _info "Updating upstream configuration information${_VERBOSE_FORCE} ..."
+
+            # get package version with spec
+            get_spec_version "build/${KP_BUILD_SPEC}"
+
+            _pushd "${WORKING_DIR}/conf"
+
+
+            sed -i -e "s/^KP_VERSION=.*/KP_VERSION=${_SPEC_VERSION}/" \
+                   -e "s/^KP_RELEASE=.*/KP_RELEASE=${_SPEC_RELEASE}/" \
+                   -e "s/^KP_RELEASE_GIT_COMMIT=.*/KP_RELEASE_GIT_COMMIT=${_LOCAL_HEAD}/" \
+                   "packages.d/${F}"
+
+            git add "packages.d/${F}"
+            git commit -m "updated: version bump for ${KP_NAME} ${_VERBOSE_FORCE}"
+
+            # push the configuration changes
+            git push origin "${CURRENT_BRANCH}"
+
+            _popd
+          fi
+        fi
+
+        _info "Up to date."
+        echo
+
+      fi
+      _popd
+    done
+
+    _info "Completed."
+  fi
+}

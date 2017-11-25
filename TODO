@@ -1,0 +1,25 @@
+* option for build "--bump" which bumps the minor release, i.e. 1%{?dist} becomes 1%{?dist}.1, or 1%{?dist}.1 becomes 1%{?dist}.2
+
+* option for build "--version" to specify the version to build, e.g.  ./src/kp --config conf/kp-csmart.conf build --version=2.1.2 mozilla-adblock-plus
+this would update the kp config and also the spec file (and reset any minor version), adding appropriate %changelog entry, e.g. "Update to version 2.1.2"
+
+* option for build "--commit" to automatically commit changes in kp and package git repos on successful build
+
+* check that version in kp config matches the version in spec files
+
+* if version you're building already exists in repo, warn
+
+* add a checksum for downloads and check this against existing tarballs, and post download
+
+* add a --clean or --force option to sync which does a git --reset hard and git clean -df so that one can revert any local changes
+
+* add a git version to the package name for packages that are built from a git tree, like handbrake (see handbrake's build.helper)
+
+* create source tarball based on the compression type in spec file, i.e. gz, bz2, xz
+* related, check SOURCE entries in spec and don't tarball if it's not a tarball (e.g. might be default-bookmarks.html)
+
+* prompt for gpg passphrase and sign keys (needs to check ~/.rpmbuild too)
+
+* needs to build delta rpms
+
+* yum groups

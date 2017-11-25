@@ -1,0 +1,182 @@
+#!/bin/bash
+#
+# Copyright 2012-2014 "Korora Project" <dev@kororaproject.org>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program. If not, see <http://www.gnu.org/licenses/>.
+#
+
+#
+# INTIALISE
+#
+OPT_VERBOSE=
+OPT_FORCE=
+
+#
+# PRIVATE FUNCTIONS
+#
+
+function _create_dirs {
+  _pushd "${WORKING_DIR}"
+
+  for D in conf packages repository release release/cache release/tmp
+  do
+    if [ ! -d "${D}" ]
+    then
+      _info " - Creating ${D}"
+      _mkdir "${D}" || _warn "Unable to create."
+    fi
+  done
+
+  _popd
+}
+
+#
+# FUNCTIONS
+#
+function usage {
+  _EXIT_VAL=${1:-0}
+
+  cat << EOF
+Usage: $0 init [options]
+
+Options:
+  -f   Force cleaning of existing paths
+  -v   Show verbose output
+  -?   Show this usage
+  -V   Show version
+
+Long Options:
+  --force       Same as -f
+  --verbose     Same as -v
+  --help        Same as -?
+  --version     Same as -V
+
+EOF
+
+  exit ${_EXIT_VAL};
+}
+
+#
+# PARSE COMMAND LINE
+#
+
+function parse_args {
+  CMD_LINE=$(getopt -n$0 -u --longoptions="force verbose version help" "f v V ?" $@)
+  [ ${?} -ne 0 ] && usage 1
+
+  set -- ${CMD_LINE}
+
+  while [ $# -gt 0 ]
+  do
+    case "$1" in
+      -f|--force)
+        OPT_FORCE=1
+        ;;
+      -v|--verbose)
+        OPT_VERBOSE=1
+        ;;
+      -V|--version)
+        version 0
+        ;;
+      --help)
+        usage 0
+        ;;
+      --)
+        shift
+        break
+        ;;
+      -*)
+        usage 1
+        ;;
+      *)
+        break
+    esac
+    shift
+  done
+}
+
+
+#
+# MAIN
+#
+
+function main {
+  _info "Initialising Korora Package environment ..."
+
+
+  # create log directory
+  _info "Preparing: ${LOG_DIR}"
+  if [ ! -d "${LOG_DIR}" ]
+  then
+    mkdir -p "${LOG_DIR}" || _warn "Unable to create log dir."
+  fi
+
+  # create working directory
+  _info "Preparing: ${WORKING_DIR}"
+
+  if [ ! -e "${WORKING_DIR}" ]
+  then
+    # doesn't exist, so create it
+    _mkdir "${WORKING_DIR}"
+    if [ $? -ne 0 ]
+    then
+      _error "Could not create working directory."
+      exit 1
+    fi
+
+    # we now have a parent dir, so create children
+    _create_dirs
+  else
+    # parent already exists, so convert working dir is absolute path
+    WORKING_DIR=$(readlink -e "${WORKING_DIR}")
+
+    if [ -n "${OPT_FORCE}" ]
+    then
+      _info "Forcing clean ..."
+
+      rm -rf "${WORKING_DIR}/*"
+    fi
+
+    _create_dirs
+  fi
+
+  if [ -w "${WORKING_DIR}" ]
+  then
+    # show disk usage of working dir
+    _DISK_AVAILABLE=$(df -h ${WORKING_DIR} | tail -n 1 | awk '{print $4}')
+    _DISK_USAGE=$(du -sh ${WORKING_DIR} | cut -f1)
+
+    # initial sync of configuration management package
+    _info "Synchronising upstream configuration information ..."
+    git clone "${GIT_URL}/kp-config" "${WORKING_DIR}/conf"
+    if [ ${?} -ne 0 ]
+    then
+      _error "Unable to sync configuration state."
+      exit 1
+    fi
+
+    _pushd "${WORKING_DIR}/conf"
+
+    git config user.name "${KP_DEV_ACCOUNT}"
+    git config user.email "${KP_DEV_EMAIL}"
+
+    _popd
+
+    _info "${_DISK_USAGE}B used - ${_DISK_AVAILABLE}B remaining"
+  else
+    _error "Directory is not writable."
+  fi
+
+}
+

@@ -1,0 +1,668 @@
+#!/bin/bash
+#
+# Copyright 2012-2014 "Korora Project" <dev@kororaproject.org>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program. If not, see <http://www.gnu.org/licenses/>.
+#
+
+# Utility functions for Korora building.
+
+#
+# GENERAL
+#
+
+function is_element {
+  local _HAYSTACK _NEEDLE=${1}
+  shift
+
+  for _HAYSTACK; do
+    [[ ${_HAYSTACK} == ${_NEEDLE} ]] && return 0
+  done
+
+  return 1
+}
+
+function is_root {
+  [ "$(id -u)" -eq 0 ] && return 0
+
+  return 1
+}
+
+function _machine_basearch {
+  echo $(uname -m)
+}
+
+
+function _machine_releasever {
+  echo $( . /etc/os-release 2>/dev/null && echo $VERSION_ID || echo "0" )
+}
+
+function _machine_dist {
+  _NAME=$( . /etc/os-release 2>/dev/null && echo $NAME )
+  case $_NAME in
+    Fedora|fedora)
+      echo "fedora"
+      ;;
+    Korora|korora|Kororaa|kororaa)
+      echo "korora"
+      ;;
+    *)
+      echo "unknown"
+  esac
+}
+
+function _is_dir_empty {
+  _DIR=${1:-}
+
+  # check if dir exists
+  [ -d "${_DIR}" ] && return 2
+
+  # check if dir has files
+  [ "$(ls -A ${_DIR})" ] && return 1
+
+  return 0
+}
+#
+# VERSION/USAGE
+#
+
+function version {
+  _EXIT_VAL=${1:-0}
+
+  echo "${SCRIPT} - v${VERSION}"
+  echo
+  echo "Member of the Korora Packaging Utility. Written by the kororaproject.org team."
+  echo "Powered by freedom, dedication and the pursuit of perfection."
+  echo
+  echo "http://www.kororaproject.org"
+  echo
+
+  exit ${_EXIT_VAL}
+}
+
+#
+# PRINT HANDLING
+#
+
+function _log {
+  _MSG=${1:-""}
+
+  if [ -w "${LOG_FILE}" ]
+  then
+    echo -e "L: ${_MSG}" >> ${LOG_FILE}
+  fi
+}
+
+function _error {
+  _MSG=${1:-""}
+
+  echo -e "${_MSG}" >&2
+
+  if [ -w "${LOG_FILE}" ]
+  then
+    echo -e "E: ${_MSG}" >> ${LOG_FILE}
+  fi
+}
+
+function _warn {
+  _MSG=${1:-""}
+
+  echo -e "${_MSG}" >&2
+
+  if [ -w "${LOG_FILE}" ]
+  then
+    echo -e "W: ${_MSG}" >> ${LOG_FILE}
+  fi
+}
+
+function _info {
+  _MSG=${1:-""}
+
+  echo -e "${_MSG}" >&2
+
+  if [ -w "${LOG_FILE}" ]
+  then
+    echo -e "I: ${_MSG}" >> ${LOG_FILE}
+  fi
+}
+
+function _debug {
+  _MSG=${1:-""}
+
+  [ "${DEBUG}" == "1" ] || return 0
+
+  echo -e "${_MSG}" >&2
+
+  if [ -w "${LOG_FILE}" ]
+  then
+    echo -e "D: ${_MSG}" >> ${LOG_FILE}
+  fi
+}
+
+#
+# DIRECTORY HANDLING FUNCTIONS
+#
+function _mkdir {
+  _DIR=${1:-}
+
+  # ensure an valid name is given
+  [ "x${_DIR}" == "x" ] && return 1
+  [ "${_DIR}" == "." ] && return 1
+  [ "${_DIR}" == ".." ] && return 1
+
+  # check if directory already exists
+  [ -d "${_DIR}" ] && return 0
+
+  mkdir -p "${_DIR}"
+}
+
+
+function _pushd {
+  _DIR=${1:-}
+
+  # ensure directory exists
+  [ -d "${_DIR}" ] || return 1
+
+  # suppress pushd output
+  pushd "${_DIR}" >/dev/null 2>&1
+}
+
+function _popd {
+  # suppress pushd output
+  popd >/dev/null 2>&1
+}
+
+#
+# GIT HELPERS FUNCTIONS
+#
+function _git_branch_active {
+  __GIT=$(git branch | grep ^* | awk '{print $2}')
+
+  if [ ${?} -eq 0 ]
+  then
+    echo ${__GIT}
+  else
+    _error "${__GIT}"
+  fi
+}
+
+function _git_local_branch_available {
+  __BRANCH=${1:-____}
+
+  git branch -a | grep -v "remotes/" | grep -q "${__BRANCH}$"
+}
+
+function _git_remote_branch_available {
+  __BRANCH=${1:-____}
+
+  git branch -a | grep -q "remotes/origin/${__BRANCH}$"
+}
+
+function _git_branch_available {
+  __BRANCH=${1:-____}
+
+}
+
+function _git_branch_switch {
+  __BRANCH=${1:-____}
+  __CREATE=${2:-}
+
+  if _git_local_branch_available "${__BRANCH}"
+  then
+    # checkout the local branch which will already be tracking remote
+    _OUT=$(git checkout "${__BRANCH}")
+
+    if [ ${?} -ne 0 ]
+    then
+      _RET=1
+      _error "Unable to checkout ${__BRANCH}. ${_OUT}"
+    fi
+  elif _git_remote_branch_available "${__BRANCH}"
+  then
+    _info "Local branch not available, establishing and tracking remote."
+    # checkout the remote branch with tracking implicit
+    _OUT=$(git checkout --track -b "${__BRANCH}" origin/${__BRANCH})
+
+    if [ ${?} -ne 0 ]
+    then
+      _RET=1
+      _error "Unable to checkout ${__BRANCH}. ${_OUT}"
+    fi
+  elif [ "${__CREATE}" == "1" ]
+  then
+    _info "Branch not available, creating: ${__BRANCH}"
+    _OUT=$(git checkout -b "${__BRANCH}")
+  else
+    _RET=1
+    _error "Configuration branch ${__BRANCH} is not available. ${_OUT}"
+  fi
+
+  return ${_RET}
+}
+
+#
+# CONFIG HANDLING FUNCTIONS
+#
+
+function reset_config_variables {
+  KP_NAME=
+  KP_VERSION=
+  KP_URL=
+  KP_BRANCH=
+  KP_UPSTREAM_SRC_TYPE=
+  KP_UPSTREAM_SRC_GIT_URL=
+  KP_UPSTREAM_SRC_GIT_COMMIT=
+  KP_UPSTREAM_SRC_SVN_URL=
+  KP_UPSTREAM_SRC_SVN_REVISION=
+  KP_UPSTREAM_SPEC=
+  KP_BUILD_SPEC=
+  KP_BUILD_SPEC_TEMPLATE=
+  KP_BUILD_ARCH=
+  KP_RELEASE_GIT_COMMIT=
+}
+
+function load_config {
+  _PACKAGE=${1:-}
+
+  if [ -z $_PACKAGE ]
+  then
+    _debug "No package specified for loading."
+    return 1
+  elif [ -r "${WORKING_DIR}/conf/packages.d/${_PACKAGE}" ]
+  then
+    _PACKAGE_CONF="${WORKING_DIR}/conf/packages.d/${_PACKAGE}"
+  elif [ -r "${WORKING_DIR}/conf/packages.d/${_PACKAGE}.conf" ]
+  then
+    _PACKAGE_CONF="${WORKING_DIR}/conf/packages.d/${_PACKAGE}.conf"
+  else
+    _debug "Can't find configuration for ${_PACKAGE}"
+    return 1
+  fi
+
+  # reset all available config variables
+  reset_config_variables
+
+  # source the config variables
+  source "${_PACKAGE_CONF}"
+
+  # TODO: validate the config
+  # we need KP_NAME, KP_VERSION, KP_RELEASE, KP_URL, KP_BUILD_SPEC_TEMPLATE
+  # KP_BUILD_ARCH as a minimum
+  if [ -z "${KP_NAME}" ]
+  then
+    _error "KP_NAME is missing from ${_PACKAGE} config."
+  elif [ -z "${KP_VERSION}" ]
+  then
+    _error "KP_VERSION is missing from ${_PACKAGE} config."
+  elif [ -z "${KP_RELEASE}" ]
+  then
+    _error "KP_RELEASE is missing from ${_PACKAGE} config."
+  elif [ -z "${KP_BUILD_SPEC}" -a -z "${KP_BUILD_SPEC_TEMPLATE}" ]
+  then
+    _error "KP_BUILD_SPEC or KP_BUILD_SPEC_TEMPLATE is missing from ${_PACKAGE} config."
+  else
+    return 0
+  fi
+
+  return 1
+}
+
+#
+# string list_config_available(string packages)
+#
+# Returns a list of avilable Korora packages. An optional argument "package" can
+# be supplied to filter the list.
+#
+# Note: assumes the package config has been sourced
+#
+
+function list_config_validate {
+  _PACKAGES=( ${1:-} )
+  _VALID_PACKAGES=( $(awk -F= '/^KP_NAME=/ { print $2 }' ${WORKING_DIR}/conf/packages.d/kp-*.conf) )
+
+  if [ ${#_PACKAGES} -eq 0 ]
+  then
+    _PACKAGES=( ${_VALID_PACKAGES[@]} )
+  fi
+
+  if [ ${#_VALID_PACKAGES} -eq 0 ]
+  then
+    _error "No valid package configuration available."
+    return 1
+  fi
+
+  _VALID_PACKAGE_COUNT=0
+
+  for P in "${_PACKAGES[@]}"
+  do
+    is_element ${P} "${_VALID_PACKAGES[@]}" && _VALID_PACKAGE_COUNT=$((_VALID_PACKAGE_COUNT+1)) || _error "Invalid package specified: ${P}"
+  done
+
+  return $_VALID_PACKAGE_COUNT
+}
+
+#
+# string list_config_available(string packages)
+#
+# Returns a list of avilable Korora packages. An optional argument "package" can
+# be supplied to filter the list.
+#
+# Note: assumes the package config has been sourced
+#
+
+function list_config_available {
+  _PACKAGES=( ${1:-} )
+  _FILES=
+
+  for C in $(ls -1 ${WORKING_DIR}/conf/packages.d/kp-*.conf)
+  do
+    _FILE=$(basename $C)
+
+    load_config ${_FILE} || continue
+
+    if [ ${#_PACKAGES[@]} -eq 0 ]
+    then
+      _FILES="${_FILES} ${_FILE}"
+    else
+      for P in "${_PACKAGES[@]}"
+      do
+        if [ "${P}" == "${KP_NAME}" ]
+        then
+          _FILES="${_FILES} ${_FILE}"
+        fi
+      done
+    fi
+  done
+
+  echo ${_FILES}
+}
+
+function check_config_pacakge {
+  _FILE=${1:-}
+  load_config ${_FILE} || return 1
+
+  _pushd "${WORKING_PACKAGES_DIR}/${KP_NAME}" || return 1
+}
+
+
+#
+# KICKSTART HANDLING FUNCTIONS
+#
+
+
+#
+# string list_kickstart_available(string kickstarts)
+#
+# Returns a list of avilable Korora kickstarts. An optional argument "kickstart" can
+# be supplied to filter the list.
+#
+# Note: assumes the kickstart config has been sourced
+#
+
+function list_kickstart_validate {
+  _KICKSTARTS=( ${1:-} )
+  _VALID_KICKSTARTS=( $(ls -1 ${WORKING_DIR}/conf/kickstart.d/* | sed -r 's|.*/(.*).ks|\1|g') )
+
+  if [ ${#_KICKSTARTS} -eq 0 ]
+  then
+    _KICKSTARTS=( ${_VALID_KICKSTARTS[@]} )
+  fi
+
+  if [ ${#_VALID_KICKSTARTS} -eq 0 ]
+  then
+    _error "No valid kickstarts available."
+    return 1
+  fi
+
+  _VALID_KICKSTART_COUNT=0
+
+  for P in "${_KICKSTARTS[@]}"
+  do
+    is_element ${P} "${_VALID_KICKSTARTS[@]}" && _VALID_KICKSTART_COUNT=$((_VALID_KICKSTART_COUNT+1)) || _error "Invalid kickstart specified: ${P}"
+  done
+
+  return $_VALID_KICKSTART_COUNT
+}
+
+#
+# string list_kickstart_available(string kickstarts)
+#
+# Returns a list of avilable Korora kickstart files. An optional argument "kickstarts" can
+# be supplied to filter the list.
+#
+
+function list_kickstart_available {
+  _KICKSTARTS=( ${1:-} )
+  _FILES=
+
+  if [ -d "${WORKING_DIR}/conf/kickstart.d/" ]
+  then
+    for K in $(ls -1 ${WORKING_DIR}/conf/kickstart.d/*.ks)
+    do
+      _FILE=$(basename "$K")
+      _FILE=${_FILE%.ks}
+
+      # skip if this is not requested
+      if [ ${#_KICKSTARTS[@]} -eq 0 ]
+      then
+        _FILES="${_FILES} ${_FILE}"
+      else
+        for K in "${_KICKSTARTS[@]}"
+        do
+          if [ "${K}" == "${_FILE}" ]
+          then
+            _FILES="${_FILES} ${_FILE}"
+          fi
+        done
+      fi
+    done
+  fi
+
+  echo ${_FILES}
+}
+
+#
+# SYNCRHONISATION FUNCTIONS
+#
+
+#
+# expects a configuration file to be loaded and
+# thus KP_NAME is valid
+#
+function get_sync_status {
+  _USE_CACHE=${1:-}
+
+  KP_PACKAGE_SYNC_STATE="-"
+  KP_UPSTREAM_SYNC_STATE=" "
+  KP_BRANCH="unknown"
+
+  if [ -z ${KP_NAME} ]
+  then
+    _error "No configuration file loaded (KP_NAME undefined). Unable to determine sync status."
+    return 1
+  elif [ -z ${KP_UPSTREAM_SRC_TYPE} ]
+  then
+    _error "No upstream type specified (KP_UPSTREAM_SRC_TYPE undefined)."
+    return 1
+  fi
+
+  # sync requires the package directory to exist
+  [ ! -d ${WORKING_PACKAGES_DIR}/${KP_NAME} ] && return 0
+
+  _pushd "${WORKING_PACKAGES_DIR}/${KP_NAME}"
+
+  KP_BRANCH=$(_git_branch_active)
+  KP_PACKAGE_SYNC_STATE="M"
+
+  # commit/sync check
+  _UNCOMMITED_CHANGES=$(git status -s | grep -v ^?? | wc -l)
+
+  if [ ${_UNCOMMITED_CHANGES} -eq 0 ]
+  then
+    KP_PACKAGE_SYNC_STATE="S"
+  fi
+
+  _popd
+
+  # sync requires the package upstream directory to sync
+  [ ! -d "${WORKING_PACKAGES_DIR}/${KP_NAME}/upstream" ] && return 0
+
+  _pushd "${WORKING_PACKAGES_DIR}/${KP_NAME}/upstream"
+
+  # assume modified unless proven in sync
+  KP_UPSTREAM_SYNC_STATE="M"
+
+  # need to assess sync based on type
+  if [ "${KP_UPSTREAM_SRC_TYPE}" == "git" ]
+  then
+    if [ -n "${_USE_CACHE}" ]
+    then
+      # update tree, fetching all branches and tags
+      _debug "Updating all branches and tags from origin."
+      _OUT=$(git fetch --all --tags 2>&1)
+      if [ ${?} -ne 0 ]
+      then
+        _debug "${_OUT}"
+      fi
+    fi
+
+    # commit/sync check
+    _UNCOMMITED_CHANGES=$(git status -s | grep -v ^?? | wc -l)
+
+    if [ "x${KP_UPSTREAM_SRC_GIT_COMMIT}" != "x" ]
+    then
+      # get the last commit and uncommit count
+      _LATEST_COMMIT=$(git log --pretty=format:'%H' -n 1)
+      _UPSTREAM_LOC=$(git log --pretty=format:'%H' | grep -n ${KP_UPSTREAM_SRC_GIT_COMMIT} | cut -d: -f1)
+
+      if [ ${_UPSTREAM_LOC} -gt 1 ]
+      then
+        KP_UPSTREAM_SYNC_STATE="+"
+      elif [ ${_UPSTREAM_LOC} -gt 1 ]
+      then
+        KP_UPSTREAM_SYNC_STATE="S"
+      else
+        KP_UPSTREAM_SYNC_STATE="?"
+      fi
+    elif [ ${_UNCOMMITED_CHANGES} -eq 0 ]
+    then
+      KP_UPSTREAM_SYNC_STATE="s"
+    fi
+  elif [ "${KP_UPSTREAM_SRC_TYPE}" == "svn" ]
+  then
+    _warn "TODO: implement SVN sync check."
+  elif [ "${KP_UPSTREAM_SRC_TYPE}" == "local" ]
+  then
+    if [ -n "${_USE_CACHE}" ]
+    then
+      # update tree, fetching all branches and tags
+      _debug "Updating all branches and tags from origin."
+      _OUT=$(git fetch --all --tags 2>&1)
+      if [ ${?} -ne 0 ]
+      then
+        _debug "${_OUT}"
+      fi
+    fi
+
+    # commit/sync check
+    _UNCOMMITED_CHANGES=$(git status -s | grep -v ^?? | wc -l)
+
+    if [ "x${KP_RELEASE_GIT_COMMIT}" != "x" ]
+    then
+      # get the last commit and uncommit count
+      _LATEST_COMMIT=$(git log --pretty=format:'%H' -n 1)
+      _UPSTREAM_LOC=$(git log --pretty=format:'%H' | grep -n ${KP_RELEASE_GIT_COMMIT} | cut -d: -f1)
+
+      # couldn't find the release commit inside upstream
+      [ -z "${_UPSTREAM_LOC}" ] && _UPSTREAM_LOC=-1
+
+      if [ ${_UPSTREAM_LOC} -gt 1 ]
+      then
+        KP_UPSTREAM_SYNC_STATE="+"
+      elif [ ${_UPSTREAM_LOC} -eq 1 ]
+      then
+        KP_UPSTREAM_SYNC_STATE="S"
+      else
+        KP_UPSTREAM_SYNC_STATE="?"
+      fi
+    elif [ ${_UNCOMMITED_CHANGES} -eq 0 ]
+    then
+      KP_UPSTREAM_SYNC_STATE="s"
+    fi
+  else
+    _warn "Unknown upstream source type specified: ${KP_UPSTREAM_SRC_TYPE}"
+  fi
+
+  _popd
+}
+
+
+
+
+#
+# SPEC HANDLING FUNCTIONS
+#
+
+#
+# void get_spec_version(string path)
+#
+# Determines the release and version specified in the spec file. The following
+# variables will be set:
+#   - _SPEC_VERSION
+#   - _SPEC_RELEASE
+#
+# If the version or release can not be determined a default value of 0 is set.
+#
+# Parameters:
+#   - path   path to the spec file
+#
+function get_spec_version {
+  _FILE=${1:-}
+
+  if [ ! -f "${_FILE}" ]
+  then
+    _error "spec file path does not exist: ${FILE}"
+    return 1
+  fi
+
+  _SPEC_VERSION=0
+  _SPEC_RELEASE=0
+
+  # ensure the file is readable
+  if [ -r "${_FILE}" ]
+  then
+    # extract all global/define variables and evaluate them to the stack via "name=foo"
+    IFS=$'\n'
+    for V in $(grep -e ^%define -e ^%global ${_FILE} | sed -r -e 's/-([a-zA-Z0-9]+)/_\1/g' -e 's/%(define|global)\s+([a-zA-Z0-9_]+)\s+([^ ]+)/\2="\3"/' )
+    do
+      eval "__$V" 2>/dev/null
+    done
+    unset IFS
+
+    # perform variable substition by replace spec specific variables (%{var}) with our stack variables ($__var) and evaulate
+    _SPEC_VERSION=$(awk '/^Version:/ { print $2 }' "${_FILE}" | sed -r -e "s/%\{([^\}]+)\}/\$\{__\\1\}/g" -e 's/-([a-zA-Z0-9]+)/_\1/g')
+    _SPEC_VERSION=$(eval echo ${_SPEC_VERSION})
+    _SPEC_RELEASE=$(awk '/^Release:/ { print $2 }' ${_FILE} | sed -r -e 's/%\{\?dist\}(.*)/\1/' -e "s/%\{([^}]+)\}/\$\{__\\1\}/g" -e 's/-([a-zA-Z0-9]+)/_\1/g')
+    _SPEC_RELEASE=$(eval echo ${_SPEC_RELEASE})
+  fi
+
+  return 0
+}
+
+
+#
+# RELEASE FUNCTIONS
+#
+
+

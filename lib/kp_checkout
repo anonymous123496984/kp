@@ -1,0 +1,354 @@
+#!/bin/bash
+#
+# Copyright 2012-2014 "Korora Project" <dev@kororaproject.org>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program. If not, see <http://www.gnu.org/licenses/>.
+#
+
+#
+# INTIALISE
+#
+OPT_VERBOSE=
+OPT_CHECKOUT_ONLY=
+OPT_RELEASE=
+OPT_NO_UPSTREAM=
+OPT_CREATE_BRANCH=
+OPT_INCLUDE_DEPRECATED=
+
+
+#
+# PRIVATE FUNCTIONS
+#
+function _configuration_branch_active {
+  _pushd "${WORKING_DIR}/conf"
+  _BRANCH_CURRENT=$(_git_branch_active)
+  _popd
+}
+
+function _checkout_configuration_branch {
+  _BRANCH=${1:-}
+
+  # ensure a branch is specified
+  if [ -z "${_BRANCH}" ]
+  then
+    _error "No branch specified for configuration checkout."
+    return 1
+  fi
+
+  _pushd "${WORKING_DIR}/conf"
+
+  _BRANCH_CURRENT=$(_git_branch_active)
+  _RET=0
+
+  if [ "${_BRANCH_CURRENT}" != "${_BRANCH}" ]
+  then
+    _info "Configuration is currently set for: ${_BRANCH_CURRENT}"
+
+    _git_branch_switch "${_BRANCH}" "${OPT_CREATE_BRANCH}"
+    _RET=$?
+  fi
+
+  _popd
+
+  return ${_RET}
+}
+
+#
+# int package_upstream_checkout(void)
+#
+# Performs a checkout of a Korora package's upstream into respective upstream
+# package directory.
+#
+# Note: assumes the package config has been sourced
+#
+
+function _package_upstream_checkout {
+  if [ -z ${KP_NAME} ]
+  then
+    _error "No configuration file loaded (KP_NAME undefined). Unable to checkout package."
+    return 1
+  elif [ -z ${KP_UPSTREAM_SRC_TYPE} ]
+  then
+    _error "No upstream type specified (KP_UPSTREAM_SRC_TYPE undefined)."
+    return 1
+  fi
+
+  _UPSTREAM_DIR="${WORKING_PACKAGES_DIR}/${KP_NAME}/upstream"
+
+  # need to assess checkout based on type
+  if [ "${KP_UPSTREAM_SRC_TYPE}" == "git" ]
+  then
+    _mkdir "${_UPSTREAM_DIR}"
+
+    # check if we have a checkout already
+    if [ ! -d "${_UPSTREAM_DIR}/.git" ]
+    then
+      # update tree, fetching all branches and tags
+      _debug "Cloning upstream: ${KP_UPSTREAM_SRC_URL}"
+
+      _OUT=$(git clone "${KP_UPSTREAM_SRC_URL}" "${WORKING_PACKAGES_DIR}/${KP_NAME}/upstream")
+      if [ ${?} -ne 0 ]
+      then
+        _error "${_OUT}"
+      fi
+
+    # we already exist
+    else
+      true
+    fi
+
+    _warn "TODO: implement git sync check"
+  elif [ "${KP_UPSTREAM_SRC_TYPE}" == "svn" ]
+  then
+    _mkdir "${_UPSTREAM_DIR}"
+    _warn "TODO: implement SVN sync check."
+  elif [ "${KP_UPSTREAM_SRC_TYPE}" == "local" ]
+  then
+    _debug "Upstream already available in local package."
+  elif [ "${KP_UPSTREAM_SRC_TYPE}" == "binary" ]
+  then
+    _debug "Upstream not available for binary package types."
+  elif [ "${KP_UPSTREAM_SRC_TYPE}" == "bare" ]
+  then
+    _debug "Upstream not available for bare package types."
+  else
+    _warn "Unknown upstream source type specified: ${KP_UPSTREAM_SRC_TYPE}"
+  fi
+
+  return 0
+}
+
+#
+# int package_checkout(void)
+#
+# Performs a checkout of a Korora package into the working directory.
+#
+# Note: assumes the package config has been sourced
+#
+function _package_checkout {
+  if [ -z ${KP_NAME} ]
+  then
+    _error "No configuration file loaded (KP_NAME undefined). Unable to checkout package."
+    return 1
+  fi
+
+  _WORKING_PATH="${WORKING_PACKAGES_DIR}/${KP_NAME}"
+
+  # check if destination path already exists
+  if [ ! -d "${_WORKING_PATH}" ]
+  then
+    _debug "Creating package path: ${_WORKING_PATH}"
+
+    if ! mkdir -p ${_WORKING_PATH}
+    then
+      _error "Unable to create package path: ${_WORKING_PATH}"
+      return 1
+    fi
+
+    # update tree, fetching all branches and tags
+    _debug "Cloning from: ${KP_URL}"
+
+    _OUT=$(git clone "${KP_URL}" "${_WORKING_PATH}")
+    if [ ${?} -ne 0 ]
+    then
+      _error "Unable to clone package."
+      return 1
+    fi
+
+    # set
+    _pushd "${_WORKING_PATH}"
+
+    git config user.name "${KP_DEV_ACCOUNT}"
+    git config user.email "${KP_DEV_EMAIL}"
+
+    _popd
+  fi
+
+  _pushd "${_WORKING_PATH}"
+
+  # switch to our requested branch
+  _git_branch_switch "${OPT_RELEASE}" "${OPT_CREATE_BRANCH}"
+  if [ ${?} -ne 0 ]
+  then
+    _error "Unable to switch branch."
+    return 1
+  fi
+
+  _warn "TODO: implement commit check"
+
+  # get the last commit and uncommit count
+  _LATEST_COMMIT=$(git log --pretty=format:'%H' -n 1)
+  _UNCOMMITED_CHANGES=$(git status -s | wc -l)
+
+  _popd
+
+  return 0
+}
+
+#
+# FUNCTIONS
+#
+function usage {
+  _EXIT_VAL=${1:-0}
+
+  cat << EOF
+Usage: $0 [-v] -r RELEASE package1 package2 ... packageN
+
+Options:
+  -n          Don't checkout the upstream source
+  -r RELEASE  Checkout specified Korora release
+  -v          Show verbose output
+  -?          Show this usage
+  -V          Show version
+
+Long Options:
+  --create                Create release branch if not existing
+  --no-upstream           Same as -n
+  --release               Same as -r
+  --include-deprecated    Include deprecated packages
+  --verbose               Same as -v
+  --help                  Same as -?
+  --version               Same as -V
+
+EOF
+
+  exit ${_EXIT_VAL};
+}
+
+#
+# PARSE COMMAND LINE
+#
+
+function parse_args {
+  CMD_LINE=$(getopt -n$0 -u --longoptions="create no-upstream release: verbose version help" "n r: v V ?" $@)
+  [ ${?} -ne 0 ] && usage 1
+
+  set -- ${CMD_LINE}
+
+  while [ $# -gt 0 ]
+  do
+    case "$1" in
+      --create)
+        OPT_CREATE_BRANCH=1
+        ;;
+      -n|--no-upstream)
+        OPT_NO_UPSTREAM=1
+        ;;
+      -r|--release)
+        shift
+        OPT_RELEASE=$1
+        ;;
+      -v|--verbose)
+        OPT_VERBOSE=1
+        ;;
+      -V|--version)
+        version 0
+        ;;
+      -h|--help)
+        usage 0
+        ;;
+      --include-deprecated)
+        OPT_INCLUDE_DEPRECATED=1
+        ;;
+      --)
+        shift
+        break
+        ;;
+      -*)
+        usage 1
+        ;;
+      *)
+        break
+    esac
+    shift
+  done
+
+  # remaining arguments are packages
+  PACKAGES=
+  if [ $# -eq 0 ]
+  then
+    echo "Checking out all packages ..."
+  else
+    while [ $# -gt 0 ]
+    do
+      PACKAGES="${PACKAGES} $1"
+      shift
+    done
+  fi
+}
+
+#
+# MAIN
+#
+
+function main {
+  # ensure a release is defined
+  if [ -z "${OPT_RELEASE}" ]
+  then
+    _error "No release defined."
+    return 1
+  fi
+
+  _info "Checking out Korora release ${OPT_RELEASE}"
+
+  _checkout_configuration_branch "${OPT_RELEASE}"
+  if [ ${?} -ne 0 ]
+  then
+    _error "Failed to checkout configuration branch ${OPT_RELEASE}, aborting."
+    _error "If the branch exists remotely, try '$0 sync --fetch-only' then re-run this checkout, else add '--create' to make this branch."
+    exit 1
+  fi
+
+  list_config_validate "${PACKAGES}"
+  if [ ${?} -gt 0 ]
+  then
+
+    # load the configuration
+    for F in $(list_config_available "${PACKAGES}")
+    do
+      load_config ${F}
+
+      # check for package deprecation, skip unless we're including them
+      if [ "${KP_DEPRECATED}" == "yes" -a "${OPT_INCLUDE_DEPRECATED}" != "1" ]
+      then
+        _debug "Skipping deprecated package: ${KP_NAME}"
+        echo
+        continue
+      fi
+
+      # start the checkout
+      echo "Checking out: ${KP_NAME}"
+
+      # grab the korora package
+      _package_checkout
+      if [ ${?} -ne 0 ]
+      then
+        _error "Failed to checkout ${KP_NAME} on branch ${OPT_RELEASE}, aborting."
+        _error "If the branch exists remotely, try '$0 sync --fetch-only' then re-run this checkout, else add '--create' to make this branch."
+        exit 1
+      fi
+
+      # grab the relevant upstream source
+      if [ "${OPT_NO_UPSTREAM}" != "1" ]
+      then
+        _package_upstream_checkout
+      fi
+
+      echo
+    done
+
+    _info "Completed."
+  fi
+}
+

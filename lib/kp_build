@@ -1,0 +1,607 @@
+#!/bin/bash
+#
+# Copyright 2012-2014 "Korora Project" <dev@kororaproject.org>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program. If not, see <http://www.gnu.org/licenses/>.
+#
+
+#
+# INITIALISE
+#
+OPT_VERBOSE=
+OPT_MOCK_CLEAN=
+OPT_MOCK_CLEAN_EACH=
+OPT_PAUSE_ON_ERROR=
+OPT_SIGN=
+OPT_INCLUDE_DEPRECATED=
+
+OPT_DIST=$(_machine_dist)
+OPT_RELEASEVER=$(_machine_releasever)
+OPT_BASEARCH=$(_machine_basearch)
+OPT_TYPE=releases
+MOCK_BIN=/usr/bin/mock
+MOCK_OPTS=
+
+#
+# PRIVATE FUNCTIONS
+#
+
+function _template_inflate {
+  _OUT_FILE=${1:-}
+  _IN_FILE=${2:-}
+
+  if [ -f "${_IN_FILE}" ]
+  then
+    cp "${_IN_FILE}" "${_OUT_FILE}" || return 1
+  fi
+
+  # substitute variables
+  sed -i "s@%%KP_PATCHES%%@${_PATCH_FILES}@g" ${_OUT_FILE}
+  sed -i "s@%%KP_PATCHES_APPLY%%@${_PATCH_FILES_APPLY}@g" ${_OUT_FILE}
+
+  sed -i "s@%%KP_BASEARCH%%@${OPT_BASEARCH}@g" ${_OUT_FILE}
+  sed -i "s@%%KP_VERSION%%@${KP_VERSION}@g" ${_OUT_FILE}
+  sed -i "s@%%KP_RELEASE%%@${KP_RELEASE}@g" ${_OUT_FILE}
+}
+
+function _check_upstream {
+  echo "check_upstream"
+  if [ -d "${WORKING_PACKAGES_DIR}/${KP_NAME}/upstream" ]
+  then
+    echo "do git rebase stuff"
+    echo "copy patches to  ${WORKING_PACKAGES_DIR}/${KP_NAME}/build/sources/"
+  fi
+}
+
+function _initialise_mock {
+  _debug "Initialising mock build environment.."
+  ${MOCK_BIN} ${MOCK_OPTS} --root ${OPT_DIST}-${OPT_RELEASEVER}-${OPT_BASEARCH} --clean
+  ${MOCK_BIN} ${MOCK_OPTS} --root ${OPT_DIST}-${OPT_RELEASEVER}-${OPT_BASEARCH} --init
+  _MOCK_CLEAN=1
+}
+
+function _generate_spec {
+  __BUILD_DIR="${WORKING_PACKAGES_DIR}/${KP_NAME}/build/"
+
+  # add missing build dir
+  [ -d "${__BUILD_DIR}" ] || mkdir -p "${__BUILD_DIR}"
+  _pushd "${__BUILD_DIR}"
+
+  # calculate patch list
+  _PATCH_FILES=
+  _PATCH_FILES_APPLY=
+  _PATCH_COUNT=0
+
+  for F in $(ls -1 sources/*.patch 2>/dev/null)
+  do
+    F=$(basename ${F})
+    _PATCH_FILES="${_PATCH_FILES}Patch${_PATCH_COUNT}: ${F}\n"
+    _PATCH_FILES_APPLY="${_PATCH_FILES_APPLY}%patch${_PATCH_COUNT} -p1\n"
+    let "_PATCH_COUNT+=1"
+  done
+
+  # ensure sources directory exists
+  _mkdir "sources"
+
+  if [ "${KP_BUILD_SPEC:(-9)}" == ".template" ]
+  then
+    _BUILD_SPEC_TEMPLATE="${KP_BUILD_SPEC}"
+    _BUILD_SPEC="${_BUILD_SPEC_TEMPLATE/.template/}"
+
+    _info "Inflating spec file ..."
+
+    _template_inflate "${_BUILD_SPEC}" "${_BUILD_SPEC_TEMPLATE}"
+  else
+    _BUILD_SPEC="${KP_BUILD_SPEC}"
+  fi
+
+  # calculate the working version and release now that the spec has been generated
+  if [[ "${KP_UPSTREAM_SRC_TYPE}" != "srpm" ]]; then
+    get_spec_version "${_BUILD_SPEC}" || exit 1
+  fi
+
+  _popd
+}
+
+function _gather_source {
+  _debug "Gathering source ..."
+
+  _RET=0
+
+  case ${KP_UPSTREAM_SRC_TYPE} in
+    bare)
+      # no source files
+      ;;
+    srpm)
+      _SRPM=${KP_UPSTREAM_SRC_URL##*/}
+
+      _pushd "${WORKING_PACKAGES_DIR}/${KP_NAME}/build/sources"
+
+      if [ ! -r "${_SRPM}" ]
+      then
+        _info "Downloading SRPM: ${_SRPM} ..."
+        wget -c "$KP_UPSTREAM_SRC_URL" -O "${_SRPM}"
+      fi
+
+      # check if we got the file successfully
+      if [ $? == 0 ]; then
+        _COMPLETE=1
+        _info "Using source RPM ..."
+
+
+        # build our spec information now that we have the SRPM
+        _SPEC_VERSION=$(rpm -qp --queryformat="%{version}" "${_SRPM}")
+        _SPEC_RELEASE=$(rpm -qp --queryformat="%{release}" "${_SRPM}" | sed 's/\.fc.*$//')
+      else
+        _error "Failed to get full source RPM."
+        _RET=1
+      fi
+
+      _popd
+      ;;
+    binary|spec)
+      # assume downloading sources is already donw and not required
+      _COMPLETE=1
+
+      # check if all files to be download already exist first
+      IFS=$'\n'
+      for F in $(spectool -l "${WORKING_PACKAGES_DIR}/${KP_NAME}/build/${_BUILD_SPEC}" | awk '{print $2}')
+      do
+        # mark as incomplete if we can't find a file
+        [ -r "${WORKING_PACKAGES_DIR}/${KP_NAME}/build/sources/${F##*/}" ] || _COMPLETE=0
+      done
+      unset IFS
+
+      # check if we missed a file
+      if [ ${_COMPLETE} -eq 0 ]
+      then
+        _info "Downloading source(s) ..."
+        # create a temporary download dir so we can atomic copy
+        _TMP=$(mktemp --tmpdir -d "spec-download.XXXXXX")
+        _pushd "${_TMP}"
+
+        spectool -g "${WORKING_PACKAGES_DIR}/${KP_NAME}/build/${_BUILD_SPEC}" -C "."
+        if [ ${?} -eq 0 ]
+        then
+          _is_dir_empty
+          if [ ${?} -eq 0 ]
+          then
+            _error "No files downloaded. Check your spec?."
+            _RET=1
+          else
+            mv * "${WORKING_PACKAGES_DIR}/${KP_NAME}/build/sources/"
+          fi
+        else
+          _RET=1
+        fi
+        _popd
+
+        # clean up now empty dir
+        rmdir "${_TMP}"
+      else
+        _info "Using cached version(s) of source(s)."
+      fi
+      ;;
+    git|svn)
+      # check upstream exists (required)
+      if [ ! -d "${WORKING_PACKAGES_DIR}/${KP_NAME}/upstream" ]
+      then
+        _RET=1
+        _error "The package has not been checked out."
+      fi
+      ;;
+    local)
+      if [ -d "${WORKING_PACKAGES_DIR}/${KP_NAME}/upstream" ]
+      then
+        # is alwasy a git repo
+        _pushd "${WORKING_PACKAGES_DIR}/${KP_NAME}/upstream"
+
+        _debug "Creating (local) source tarball ..."
+        git archive --format=tar.gz --prefix="${KP_NAME}-${_SPEC_VERSION}/" -o "${WORKING_PACKAGES_DIR}/${KP_NAME}/build/sources/${KP_NAME}-${_SPEC_VERSION}.tar.gz" HEAD || _RET=1
+
+        _popd
+      else
+        _error "Not a valid local package. Upstream is not available."
+        _RET=1
+      fi
+      ;;
+    *)
+      _error "Not a valid source type."
+      _RET=1
+      ;;
+  esac
+
+  return ${_RET}
+}
+
+function _mock_build {
+  _pushd "${WORKING_PACKAGES_DIR}/$KP_NAME/build/"
+
+  [ -z ${OPT_VERBOSE} ] &&  _VERBOSE="-q" || _VERBOSE="-v"
+
+  if [[ "${KP_UPSTREAM_SRC_TYPE}" != "srpm" ]]; then
+    _debug "Building source package, please wait ..."
+    ${MOCK_BIN} ${MOCK_OPTS} ${_VERBOSE} --root ${OPT_DIST}-${OPT_RELEASEVER}-${OPT_BASEARCH} --buildsrpm --spec "${_BUILD_SPEC}" --sources sources/
+  fi
+  _MOCK_RET=${?}
+
+  _MOCK_CLEAN=
+
+  if [ ${_MOCK_RET} -ne 0 ]
+  then
+    _error "Could not create source package, skipping package"
+    echo
+    return 1
+  fi
+
+  _debug "Building package, please wait ..."
+  if [[ "${KP_UPSTREAM_SRC_TYPE}" == "srpm" ]]; then
+    # we avoid --no-clean because we have srpm in sources
+    ${MOCK_BIN} ${MOCK_OPTS} ${_VERBOSE} --root ${OPT_DIST}-${OPT_RELEASEVER}-${OPT_BASEARCH} --rebuild "sources/${_SRPM}"
+  else
+    # --no-clean because we have srpm in there, else need to copy out (and build should be clean anyway)
+    ${MOCK_BIN} ${MOCK_OPTS} ${_VERBOSE} --no-clean --root ${OPT_DIST}-${OPT_RELEASEVER}-${OPT_BASEARCH} --rebuild /var/lib/mock/${OPT_DIST}-${OPT_RELEASEVER}-${OPT_BASEARCH}/result/$(basename $(grep ^Wrote: /var/lib/mock/${OPT_DIST}-${OPT_RELEASEVER}-${OPT_BASEARCH}/result/build.log |grep src.rpm |awk {'print $2'} |uniq))
+  fi
+  _MOCK_RET=${?}
+
+  _popd
+
+  if [ ${_MOCK_RET} -ne 0 ]
+  then
+    _error "Could not build package, skipping"
+    return 1
+  fi
+
+  for P in $(grep ^Wrote: /var/lib/mock/${OPT_DIST}-${OPT_RELEASEVER}-${OPT_BASEARCH}/result/build.log | awk {'print $2'} | uniq)
+  do
+    _P="$(basename ${P})"
+    _SP="/var/lib/mock/${OPT_DIST}-${OPT_RELEASEVER}-${OPT_BASEARCH}/result/${_P}"
+
+    if [ "${P:(-7)}" == "src.rpm" ]
+    then
+      _debug "Copying source package: ${_P}"
+      cp -f ${_SP} ${_REPO_SOURCE_DIR}
+    else
+      _debug "Copying package: ${_P}"
+      cp -f ${_SP} ${_REPO_ARCH_DIR}
+    fi
+  done
+}
+
+#
+# FUNCTIONS
+#
+
+function usage {
+  _EXIT_VAL=${1:-0}
+
+  cat << EOF
+Usage: $0 [-vc]
+
+Options:
+  -a   Set base architecture
+  -d   Set distribution
+  -r   Set release version
+  -t   Package is for testing repository
+  -x   Initialise mock to a clean state before building all packages
+  -X   Initialise mock to a clean state before building each package
+  -v   Show verbose output
+  -?   Show this usage
+  -V   Show version
+
+Long Options:
+  --arch                  Same as -a
+  --distribution          Same as -d
+  --releasever            Same as -r
+  --testing               Same as -t
+  --clean                 Same as -x
+  --clean-each-package    Same as -X
+  --sign                  Sign package once it's built
+  --pause-on-error        Pause before continuing on package build error
+  --include-deprecated    Include deprecated packages
+  --verbose               Same as -v
+  --help                  Same as -?
+  --version               Same as -V
+
+EOF
+
+  exit ${_EXIT_VAL};
+}
+
+#
+# PARSE COMMAND LINE
+#
+
+function parse_args {
+  CMD_LINE=$(getopt -n$0 -u --longoptions="arch: distribution: releasever: testing clean clean-each-package no-sign pause-on-error include-deprecated verbose version help" "a: d: r: t x X v V ?" $@)
+  [ ${?} -ne 0 ] && usage 1
+
+  set -- ${CMD_LINE}
+
+  while [ $# -gt 0 ]
+  do
+    case "$1" in
+      -a|--arch)
+        OPT_BASEARCH=$2
+        shift
+        ;;
+      -d|--distribution)
+        OPT_DIST=$2
+        shift
+        ;;
+      -t|--testing)
+        OPT_TYPE=testing
+        shift
+        ;;
+      -r|--releasever)
+        OPT_RELEASEVER=$2
+        shift
+        ;;
+      -x|--clean)
+        OPT_MOCK_CLEAN=1
+        ;;
+      -X|--clean-each-package)
+        OPT_MOCK_CLEAN_EACH=1
+        ;;
+      --sign)
+        OPT_SIGN=1
+        ;;
+      --pause-on-error)
+        OPT_PAUSE_ON_ERROR=1
+        ;;
+      --include-deprecated)
+        OPT_INCLUDE_DEPRECATED=1
+        ;;
+      -v|--verbose)
+        OPT_VERBOSE=1
+        ;;
+      -V|--version)
+        version 0
+        ;;
+      -h|--help)
+        usage 0
+        ;;
+      --)
+        shift
+        break
+        ;;
+      -*)
+        usage 1
+        ;;
+      *)
+        break
+    esac
+    shift
+  done
+
+  # remaining arguments are packages
+  PACKAGES=""
+  if [ $# -eq 0 ]
+  then
+    echo "Building all packages ..."
+  else
+    while [ $# -gt 0 ]
+    do
+      PACKAGES="${PACKAGES} $1"
+      shift
+    done
+  fi
+
+  # if we're building for korora, we need to look at local mock
+  if [ "${OPT_DIST}" == "korora" ]
+  then
+    MOCK_OPTS="--configdir=${CONF_DIR}"
+  fi
+
+}
+
+#
+# MAIN
+#
+
+function main {
+  # local dependency checks
+  _CREATEREPO_VERSION=$(createrepo --version 2>/dev/null)
+  if [ ${?} -ne 0 ]
+  then
+    _error "Can't find createrepo. Is it installed?\nTry dnf install createrepo"
+    exit 1
+  fi
+
+  _SPECTOOL_VERSION=$(spectool --version 2>/dev/null)
+  if [ ${?} -ne 0 ]
+  then
+    _error "Can't find spectool. Is it installed?\nTry dnf install spectool"
+    exit 1
+  fi
+
+  _MOCK_VERSION=$(mock --version 2>/dev/null)
+  if [ ${?} -ne 0 ]
+  then
+    _error "Can't find mock. Is it installed?\nTry dnf install mock"
+    exit 1
+  fi
+
+  _MOCK_GROUPS=$(getent group mock | grep $(id -ng))
+  if [ ${?} -ne 0 ]
+  then
+    _error "Current user is not part of the mock group."
+    exit 1
+  fi
+
+  list_config_validate "${PACKAGES}"
+  if [ ${?} -gt 0 ]
+  then
+
+    if [ -n "$(grep 1 /sys/fs/selinux/enforce)" ]
+    then
+      _error "To avoid build errors, it is required that selinux be put into permissive mode"
+      exit 1
+    fi
+
+    _PACKAGE_BUILT=
+
+    _info "Building for ${OPT_DIST} ${OPT_RELEASEVER} (${OPT_BASEARCH})"
+    echo
+
+    if [ ! -z "${OPT_MOCK_CLEAN}" ]
+    then
+      _initialise_mock
+    fi
+
+    _REPO_SOURCE_DIR="${WORKING_REPOSITORY_DIR}/${OPT_TYPE}/${OPT_RELEASEVER}/source"
+    _REPO_ARCH_DIR="${WORKING_REPOSITORY_DIR}/${OPT_TYPE}/${OPT_RELEASEVER}/${OPT_BASEARCH}"
+
+    _debug "Copying source packages to: ${_REPO_SOURCE_DIR}"
+    _debug "Copying arch packages to: ${_REPO_ARCH_DIR}"
+    echo
+    _mkdir "${_REPO_ARCH_DIR}"
+    _mkdir "${_REPO_SOURCE_DIR}"
+
+    # load the configuration
+    for F in $(list_config_available "${PACKAGES}")
+    do
+      load_config ${F}
+      if [ ${?} -ne 0 ]; then
+        _info "Unable to load configuration. Skipping.\n"
+        continue
+      fi
+
+      _info "Loaded config: ${KP_NAME}"
+
+      # check for package deprecation, skip unless we're including them
+      if [ "${KP_DEPRECATED}" == "yes" -a "${OPT_INCLUDE_DEPRECATED}" != "1" ]
+      then
+        _debug "Skipping deprecated package: ${KP_NAME}"
+        echo
+        continue
+      fi
+
+      if [ ! -d "${WORKING_PACKAGES_DIR}/${KP_NAME}" ]
+      then
+        _error "Package is not checked out, skipping"
+        echo
+        continue
+      fi
+
+      if [ ! -z "${OPT_MOCK_CLEAN_EACH}" -a -z "${_MOCK_CLEAN}" ]
+      then
+        _initialise_mock
+      fi
+
+      [ "${KP_UPSTREAM_SRC_TYPE}" == "upstream" ] && _check_upstream ${F}
+
+      # ensure any build helpers are reset before sourcing
+      source "${LIB_DIR}/kp_buildhelper"
+
+      # source the build helper if it exists
+      if [ -r "${WORKING_PACKAGES_DIR}/${KP_NAME}/build/build.helper" ]
+      then
+        source "${WORKING_PACKAGES_DIR}/${KP_NAME}/build/build.helper"
+      elif [ "${KP_UPSTREAM_SRC_TYPE}" == "git" ]
+      then
+        _warn "This is a \"git\" upstream package. Due to SPEC file limitations it is strongly recommended that a build.helper be implemented for this package."
+      fi
+
+      build_pre_init
+      if [ ${?} != 0 ]
+      then
+        _debug "Failed build_pre_init"
+        continue
+      fi
+
+      _generate_spec ${F}
+      if [ ${?} != 0 ]
+      then
+        _debug "Failed generate_spec"
+        continue
+      fi
+
+      build_pre_fetch
+      if [ ${?} != 0 ]
+      then
+        _debug "Failed build_pre_fetch"
+        continue
+      fi
+
+      _gather_source ${F}
+      if [ ${?} != 0 ]
+      then
+        _debug "Failed gather_source"
+        continue
+      fi
+
+      build_pre_build
+      if [ ${?} != 0 ]
+      then
+        _debug "Failed build_pre_build"
+        continue
+      fi
+
+      _info "Building: ${KP_NAME} (${_SPEC_VERSION}-${_SPEC_RELEASE})"
+
+      _mock_build ${F}
+      if [ ${?} != 0 ]
+      then
+        _debug "Failed mock_build"
+        continue
+      fi
+
+      build_post_build
+      if [ ${?} != 0 ]
+      then
+        _debug "Failed build_post_build"
+        continue
+      fi
+
+      _PACKAGE_BUILT=1
+
+      echo
+    done
+
+    # rebuild the repository directory
+    if [ ! -z "${_PACKAGE_BUILT}" ]
+    then
+      if [[ -n "${OPT_SIGN}" && ${OPT_SIGN} -eq 1 ]]
+      then
+        _info "Signing packages ..."
+
+        # supress output for now
+        if [ -n "${KEY_ID[${OPT_RELEASEVER}]}" ]
+        then
+          _info "  - using key ${KEY_ID[${OPT_RELEASEVER}]}"
+          rpmsign --quiet --key-id=${KEY_ID[${OPT_RELEASEVER}]} --addsign ${WORKING_REPOSITORY_DIR}/${OPT_TYPE}/${OPT_RELEASEVER}/*/*.rpm >/dev/null 2>&1
+
+          if [ $? -ne 0 ]
+          then
+            _error "Could not sign packages."
+            exit 1
+          fi
+        else
+          _info "Could not find gpg key, make sure KEY_ID${OPT_RELEASEVER} is set in kp.conf"
+        fi
+        echo
+      fi
+
+      _info "Rebuilding repository metadata ..."
+
+      [ -z ${OPT_VERBOSE} ] &&  _VERBOSE="-q" || _VERBOSE="-v"
+      createrepo ${_VERBOSE} --deltas "${_REPO_ARCH_DIR}"
+      createrepo ${_VERBOSE} "${_REPO_SOURCE_DIR}"
+      echo
+    fi
+
+    _info "Completed."
+  fi
+}
